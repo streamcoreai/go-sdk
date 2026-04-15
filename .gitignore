@@ -1,0 +1,7 @@
+# Vendored dependencies
+vendor/
+
+# Compiled tests and local binaries
+*.test
+*.exe
+*.out

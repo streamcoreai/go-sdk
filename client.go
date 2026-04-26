@@ -36,6 +36,12 @@ type Client struct {
 	status     ConnectionStatus
 	transcript []TranscriptEntry
 	assistBuf  string
+	// lastToken holds the most recently used JWT (either the static
+	// config.Token or one fetched from TokenURL during Connect) so that
+	// Disconnect can reuse it on the WHIP DELETE. Servers that enforce
+	// Bearer auth on /whip will otherwise reject the teardown and skip
+	// server-side finalization (billing, transcript persistence, etc.).
+	lastToken string
 
 	audio audioState
 }
@@ -213,6 +219,11 @@ func (c *Client) Connect(ctx context.Context) error {
 		token = t
 	}
 
+	// Cache the token so Disconnect() can authenticate the WHIP DELETE.
+	c.mu.Lock()
+	c.lastToken = token
+	c.mu.Unlock()
+
 	// WHIP exchange.
 	result, err := whipOffer(c.config.WHIPEndpoint, pc.LocalDescription().SDP, c.config.Metadata, token)
 	if err != nil {
@@ -238,8 +249,27 @@ func (c *Client) Connect(ctx context.Context) error {
 // Disconnect tears down the WebRTC connection and frees resources.
 func (c *Client) Disconnect() {
 	c.cancel()
-	whipDelete(c.sessionURL, c.config.Token)
+
+	// Resolve the token used for the WHIP DELETE. Prefer the cached
+	// token captured during Connect (which may have come from TokenURL),
+	// fall back to the static config.Token, and as a last resort
+	// re-fetch from TokenURL so teardown still authenticates.
+	c.mu.Lock()
+	token := c.lastToken
+	c.mu.Unlock()
+	if token == "" {
+		token = c.config.Token
+	}
+	if token == "" && c.config.TokenURL != "" {
+		if t, err := fetchToken(c.config.TokenURL, c.config.APIKey); err == nil {
+			token = t
+		}
+	}
+	whipDelete(c.sessionURL, token)
 	c.sessionURL = ""
+	c.mu.Lock()
+	c.lastToken = ""
+	c.mu.Unlock()
 	if c.pc != nil {
 		done := make(chan struct{})
 		go func() {

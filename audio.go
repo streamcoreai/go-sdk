@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"sync"
 	"sync/atomic"
+	"time"
 
 	"github.com/godeps/opus"
 	"github.com/pion/rtp"
@@ -33,8 +34,14 @@ type audioState struct {
 	decoder     *opus.Decoder
 	decoderOnce sync.Once
 	decoderErr  error
-	remoteTrack *webrtc.TrackRemote
 	rtpBuf      []byte
+
+	// remoteTrack is the inbound track currently being read. A reconnect
+	// delivers a replacement on RemoteTrackCh, so this is re-read rather than
+	// captured once — otherwise RecvPCM would keep reading the dead track from
+	// before the drop and never recover.
+	remoteTrackMu sync.Mutex
+	remoteTrack   *webrtc.TrackRemote
 }
 
 // initAudioSend creates the Opus encoder for outbound audio.
@@ -84,15 +91,6 @@ func (c *Client) SendPCM(pcm []int16) error {
 // Returns the number of decoded samples.
 func (c *Client) RecvPCM(pcm []int16) (int, error) {
 	c.audio.decoderOnce.Do(func() {
-		// Wait for the remote track to arrive.
-		select {
-		case track := <-c.RemoteTrackCh:
-			c.audio.remoteTrack = track
-		case <-c.ctx.Done():
-			c.audio.decoderErr = c.ctx.Err()
-			return
-		}
-
 		dec, err := opus.NewDecoder(SampleRate, Channels)
 		if err != nil {
 			c.audio.decoderErr = fmt.Errorf("opus decoder: %w", err)
@@ -107,8 +105,19 @@ func (c *Client) RecvPCM(pcm []int16) (int, error) {
 	}
 
 	for {
-		n, _, err := c.audio.remoteTrack.Read(c.audio.rtpBuf)
+		track, err := c.waitForRemoteTrack()
 		if err != nil {
+			return 0, err
+		}
+
+		n, _, err := track.Read(c.audio.rtpBuf)
+		if err != nil {
+			// The track died with the connection that carried it. If recovery
+			// hands us a replacement, keep going: to the caller a reconnect
+			// should be a gap in the audio, not the end of the stream.
+			if c.discardRemoteTrack(track) {
+				continue
+			}
 			return 0, err
 		}
 
@@ -126,5 +135,54 @@ func (c *Client) RecvPCM(pcm []int16) (int, error) {
 		}
 
 		return nSamples, nil
+	}
+}
+
+// waitForRemoteTrack returns the inbound track, blocking until one arrives.
+//
+// The track is re-read on every frame rather than captured once, because a
+// reconnect replaces it: the transport that carried the old one is gone.
+func (c *Client) waitForRemoteTrack() (*webrtc.TrackRemote, error) {
+	c.audio.remoteTrackMu.Lock()
+	track := c.audio.remoteTrack
+	c.audio.remoteTrackMu.Unlock()
+	if track != nil {
+		return track, nil
+	}
+
+	select {
+	case track := <-c.RemoteTrackCh:
+		c.audio.remoteTrackMu.Lock()
+		c.audio.remoteTrack = track
+		c.audio.remoteTrackMu.Unlock()
+		return track, nil
+	case <-c.ctx.Done():
+		return nil, c.ctx.Err()
+	}
+}
+
+// discardRemoteTrack drops a track that failed to read and reports whether a
+// replacement is already available — which is how a reconnect looks from here.
+// Waits briefly rather than returning immediately, because the read fails the
+// moment the transport dies and the new track only arrives once the redial has
+// completed.
+func (c *Client) discardRemoteTrack(dead *webrtc.TrackRemote) bool {
+	c.audio.remoteTrackMu.Lock()
+	if c.audio.remoteTrack == dead {
+		c.audio.remoteTrack = nil
+	}
+	c.audio.remoteTrackMu.Unlock()
+
+	deadline := c.config.ResumeDelay*time.Duration(c.config.ResumeAttempts+1)*2 + 5*time.Second
+	select {
+	case track := <-c.RemoteTrackCh:
+		c.audio.remoteTrackMu.Lock()
+		c.audio.remoteTrack = track
+		c.audio.remoteTrackMu.Unlock()
+		return true
+	case <-time.After(deadline):
+		return false
+	case <-c.ctx.Done():
+		return false
 	}
 }

@@ -22,19 +22,37 @@ const (
 	StatusDisconnected ConnectionStatus = "disconnected"
 )
 
-// ReconnectOutcome describes where an ICE restart attempt got to.
+// ReconnectPhase identifies which recovery mechanism an attempt used.
+type ReconnectPhase string
+
+const (
+	// PhaseICERestart keeps the existing transport alive. Only possible while
+	// the connection is Disconnected; nothing above the transport notices.
+	PhaseICERestart ReconnectPhase = "ice-restart"
+	// PhaseResume rebuilds the transport and reattaches it to the same
+	// server-side conversation. The only option once the connection has Failed.
+	PhaseResume ReconnectPhase = "resume"
+)
+
+// ReconnectOutcome describes where a recovery attempt got to.
 type ReconnectOutcome string
 
 const (
 	ReconnectAttempting ReconnectOutcome = "attempting"
 	ReconnectRecovered  ReconnectOutcome = "recovered"
-	ReconnectFailed     ReconnectOutcome = "failed"
+	// ReconnectRecoveredWithoutHistory means the call works but the server
+	// could not resume the session, so the agent has forgotten the
+	// conversation and will not know what was already said. Worth surfacing
+	// to the user rather than only logging.
+	ReconnectRecoveredWithoutHistory ReconnectOutcome = "recovered-without-history"
+	ReconnectFailed                  ReconnectOutcome = "failed"
 )
 
-// ReconnectEvent reports progress of the ICE restart sequence.
+// ReconnectEvent reports progress of the recovery sequence.
 type ReconnectEvent struct {
-	Attempt     int              // 1-based attempt number
-	MaxAttempts int              // total attempts before giving up
+	Attempt     int              // 1-based attempt number, counted within the phase
+	MaxAttempts int              // attempts this phase makes before moving on
+	Phase       ReconnectPhase   // which mechanism this attempt used
 	Outcome     ReconnectOutcome // "attempting" while in flight, then the result
 	Err         error            // why the attempt failed, when Outcome is ReconnectFailed
 }
@@ -110,6 +128,24 @@ type Config struct {
 	// patching immediately would spend a restart on a connection that was
 	// about to recover by itself. Defaults to 2s.
 	ReconnectDelay time.Duration
+
+	// ResumeAttempts is how many times to redial with the session's resume
+	// token after ICE restart is no longer possible — which is the case as
+	// soon as the connection reaches Failed, and the only case for a process
+	// that was suspended or offline longer than ICE tolerates.
+	//
+	// A redial builds a new transport but reattaches to the same conversation,
+	// so history and the agent's memory survive. The deadline is the server's
+	// session_grace_ms (30s by default) measured from the drop, and the ICE
+	// restart phase spends from the same budget. Defaults to 2. Negative
+	// disables the resume phase.
+	ResumeAttempts int
+
+	// ResumeDelay is the wait before the first resume redial, doubling for
+	// each retry. Shorter than ReconnectDelay because by this point the
+	// connection is known dead — there is nothing left to wait out.
+	// Defaults to 1s.
+	ResumeDelay time.Duration
 }
 
 // EventHandler defines callbacks for voice agent events.
@@ -133,9 +169,10 @@ type EventHandler struct {
 	// This is optional and useful for custom message handling.
 	OnDataChannelMessage func(msg DataChannelMessage)
 
-	// OnReconnect is called for each ICE restart attempt and once when the
+	// OnReconnect is called for each recovery attempt and once when the
 	// outcome is known, so a UI can distinguish a recoverable drop from a
-	// lost call.
+	// lost call — and, via ReconnectRecoveredWithoutHistory, a reconnection
+	// that kept the conversation from one that lost it.
 	OnReconnect func(event ReconnectEvent)
 }
 
@@ -154,6 +191,12 @@ func (c *Config) withDefaults() Config {
 	}
 	if out.ReconnectDelay <= 0 {
 		out.ReconnectDelay = 2 * time.Second
+	}
+	if out.ResumeAttempts == 0 {
+		out.ResumeAttempts = 2
+	}
+	if out.ResumeDelay <= 0 {
+		out.ResumeDelay = time.Second
 	}
 	return out
 }

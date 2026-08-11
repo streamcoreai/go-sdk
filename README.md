@@ -97,8 +97,10 @@ Creates a new client instance.
 | `TokenURL`     | `string`           | —                                    | Token endpoint; when set, a JWT is fetched before each connection (overrides `Token`) |
 | `APIKey`       | `string`           | —                                    | Sent as `Authorization: Bearer` when fetching from `TokenURL` |
 | `ICEServers`   | `[]webrtc.ICEServer` | Google STUN server                 | ICE server configuration        |
-| `ReconnectAttempts` | `int`         | `3`                                  | ICE restarts to attempt after a drop; negative disables automatic reconnection |
-| `ReconnectDelay` | `time.Duration`  | `2s`                                 | Wait before the first restart attempt, doubling each retry |
+| `ReconnectAttempts` | `int`         | `3`                                  | ICE restarts while `Disconnected`; negative disables the phase |
+| `ReconnectDelay` | `time.Duration`  | `2s`                                 | Wait before the first ICE restart, doubling each retry |
+| `ResumeAttempts` | `int`            | `2`                                  | Resume redials once the connection has `Failed`; negative disables the phase |
+| `ResumeDelay`  | `time.Duration`    | `1s`                                 | Wait before the first redial, doubling each retry |
 
 #### `EventHandler`
 
@@ -160,43 +162,71 @@ type DataChannelMessage struct {
 
 ## Reconnection
 
-A network change mid-call — a machine moving networks, a VPN toggle, a NAT
-rebind that does not recover — kills the transport without ending the call. The
-client recovers it with an ICE restart, which keeps the *same* server session:
-the conversation history, the rolling summary, and the agent's state all
-survive, and there is no repeated greeting. This is automatic.
+A network change mid-call — a machine moving networks, a VPN toggle, a process
+suspended and resumed — kills the transport without ending the call. The client
+recovers it automatically and the conversation survives: the agent still knows
+who it is talking to and does not replay its greeting.
 
-Status goes `StatusConnected` -> `StatusReconnecting` -> `StatusConnected`. Set
-`OnReconnect` for per-attempt detail:
+Recovery runs as a **ladder of two phases**:
+
+| Phase | When | Cost |
+|-------|------|------|
+| **ICE restart** | While the connection is `Disconnected` | Invisible. Same `PeerConnection`, same DTLS, same tracks — just new candidates. |
+| **Resume redial** | Once the connection has `Failed` | A full renegotiation and a moment of silence, but the server reattaches you to the same conversation. |
+
+ICE restart is tried first because it costs nothing. It stops being possible
+the moment the connection reaches `Failed` — the server has closed its peer by
+then — which is where a process that was paused, or offline for more than about
+25 seconds, always lands. The resume phase recovers those.
+
+Status goes `StatusConnected` → `StatusReconnecting` → `StatusConnected`:
 
 ```go
 client := streamcoreai.NewClient(streamcoreai.Config{
     WHIPEndpoint:      "http://localhost:8080/whip",
-    ReconnectAttempts: 3,
+    ReconnectAttempts: 3,                // ICE restarts, 2s -> 4s -> 8s
     ReconnectDelay:    2 * time.Second,
+    ResumeAttempts:    2,                // then redials,  1s -> 2s
+    ResumeDelay:       time.Second,
 }, streamcoreai.EventHandler{
     OnReconnect: func(e streamcoreai.ReconnectEvent) {
-        log.Printf("ICE restart %d/%d: %s", e.Attempt, e.MaxAttempts, e.Outcome)
+        log.Printf("%s %d/%d: %s", e.Phase, e.Attempt, e.MaxAttempts, e.Outcome)
+        if e.Outcome == streamcoreai.ReconnectRecoveredWithoutHistory {
+            log.Println("reconnected, but the agent has lost the conversation")
+        }
     },
 })
 ```
 
+**Handle `ReconnectRecoveredWithoutHistory`.** It means the call is working but
+the server could not resume the session — usually because the client was away
+longer than `session_grace_ms` — so the agent has no memory of anything said
+before. Everything still functions, which is exactly why it goes unnoticed
+until the agent asks something it was already told.
+
 Two details worth knowing:
 
-- **The first attempt is deliberately delayed** (`ReconnectDelay`, default 2s).
-  Most drops are brief packet loss that ICE repairs unaided, and patching
-  immediately would spend a restart on a connection that was about to recover
+- **The first ICE restart is deliberately delayed** (`ReconnectDelay`, default
+  2s). Most drops are brief packet loss that ICE repairs unaided, and patching
+  immediately would spend an attempt on a connection that was about to recover
   by itself.
-- **The whole sequence must finish within ~25 seconds.** That is how long Pion
-  takes to escalate from `Disconnected` to `Failed`, at which point the server
-  closes the peer and the session is gone for good. The defaults (3 attempts at
-  2s, 4s, 8s) fit inside that window — if you raise `ReconnectAttempts`, keep
-  the total under it, or the last attempts are wasted.
+- **Both phases share one deadline.** `Disconnected` becomes `Failed` after
+  roughly 25 seconds, and the server then holds the conversation for
+  `session_grace_ms` (30s by default). Raising `ReconnectAttempts` spends
+  budget the resume phase would otherwise have.
 
-If every attempt fails, or the server reports the session is gone (404/409),
-the status becomes `StatusDisconnected`; call `Connect` again for a fresh
-session.
+Set `ReconnectAttempts` or `ResumeAttempts` negative to disable either phase.
 
+**What this means for your audio loops.** `LocalTrack` is deliberately *not*
+replaced across a redial — the same track is rebound to the new
+`PeerConnection`, so a goroutine writing RTP to it keeps working. Inbound audio
+is different: the server sends a new track, delivered on `RemoteTrackCh`.
+`RecvPCM` handles that for you (it re-acquires and keeps decoding, so a
+reconnect is a gap in the audio rather than an error). If you read
+`RemoteTrackCh` yourself, expect a second track after a reconnect and switch to
+it — the old one only returns read errors.
+
+## Audio I/O
 ## Audio I/O
 
 The SDK handles **Opus encoding/decoding and RTP packetization** internally. You only need to supply and consume raw PCM audio:

@@ -18,6 +18,13 @@ type WHIPResult struct {
 	// ETag identifies the ICE session (RFC 9725 §4.3.1) and is required to
 	// PATCH it for an ICE restart.
 	ETag string
+	// ResumeToken is a single-use credential for reattaching a later redial to
+	// this conversation. Empty when the server cannot resume — a realtime
+	// (speech-to-speech) session, whose history lives inside the provider.
+	ResumeToken string
+	// ResumeStatus is "new", "resumed", or "expired". Anything but "resumed"
+	// on a redial means the agent has no memory of the earlier conversation.
+	ResumeStatus string
 }
 
 // WHIPRestartResult holds the server's reply to an ICE restart.
@@ -54,14 +61,23 @@ func (e *WHIPRestartError) Retryable() bool {
 
 // whipOffer performs a WHIP signaling exchange per RFC 9725 §4.2:
 // POST an SDP offer, receive a 201 Created with SDP answer and Location header.
-func whipOffer(endpoint, offerSDP string, metadata map[string]string, token string) (*WHIPResult, error) {
-	// Append metadata as query parameters.
-	if len(metadata) > 0 {
+//
+// resumeToken is a StreamCore extension: it asks the server to reattach this
+// new transport to the conversation a previous connection was having, rather
+// than starting a fresh one. Check ResumeStatus on the result — a token the
+// server no longer recognises still yields a working call, but one whose agent
+// remembers nothing.
+func whipOffer(endpoint, offerSDP string, metadata map[string]string, token, resumeToken string) (*WHIPResult, error) {
+	// Append metadata and the resume token as query parameters.
+	if len(metadata) > 0 || resumeToken != "" {
 		parsed, err := url.Parse(endpoint)
 		if err == nil {
 			q := parsed.Query()
 			for k, v := range metadata {
 				q.Set(k, v)
+			}
+			if resumeToken != "" {
+				q.Set("resume", resumeToken)
 			}
 			parsed.RawQuery = q.Encode()
 			endpoint = parsed.String()
@@ -104,9 +120,11 @@ func whipOffer(endpoint, offerSDP string, metadata map[string]string, token stri
 	}
 
 	return &WHIPResult{
-		AnswerSDP:  string(answerBytes),
-		SessionURL: sessionURL,
-		ETag:       resp.Header.Get("ETag"),
+		AnswerSDP:    string(answerBytes),
+		SessionURL:   sessionURL,
+		ETag:         resp.Header.Get("ETag"),
+		ResumeToken:  resp.Header.Get("X-Resume-Token"),
+		ResumeStatus: resp.Header.Get("X-Resume-Status"),
 	}, nil
 }
 

@@ -26,8 +26,17 @@ type Client struct {
 	sessionURL string
 	// etag identifies the current ICE session; sent as If-Match on a restart.
 	etag string
-	// reconnecting guards the restart sequence so it is never doubled up.
-	reconnecting bool
+	// resumeToken is a single-use credential that reattaches a redial to this
+	// conversation. Re-issued by the server on every response.
+	resumeToken string
+	// resumeStatus is the server's answer on the last POST: "new", "resumed",
+	// or "expired".
+	resumeStatus string
+	// recovering guards the recovery sequence so it is never doubled up.
+	recovering bool
+	// generation is bumped by Connect and Disconnect so an in-flight recovery
+	// abandons itself rather than fighting the connection replacing it.
+	generation int
 
 	// LocalTrack is the outbound audio track you write RTP packets to.
 	// It is created during Connect() and available afterwards.
@@ -88,7 +97,27 @@ func (c *Client) Transcript() []TranscriptEntry {
 //
 // After Connect returns, write audio to LocalTrack and read agent audio from RemoteTrackCh.
 func (c *Client) Connect(ctx context.Context) error {
-	c.setStatus(StatusConnecting)
+	// A fresh Connect abandons whatever came before, including any resume
+	// token: this is a new conversation, not a continuation.
+	c.mu.Lock()
+	c.generation++
+	c.resumeToken = ""
+	c.mu.Unlock()
+	return c.establish(ctx, "")
+}
+
+// establish builds a peer connection and completes WHIP signaling.
+//
+// With a resume token the server reattaches this new transport to the
+// conversation the previous one was having, so the history, the rolling
+// summary and the agent's memory of the call all survive. Without one it is an
+// ordinary first connect.
+func (c *Client) establish(ctx context.Context, resumeToken string) error {
+	if resumeToken != "" {
+		c.setStatus(StatusReconnecting)
+	} else {
+		c.setStatus(StatusConnecting)
+	}
 
 	m := &webrtc.MediaEngine{}
 	if err := m.RegisterCodec(webrtc.RTPCodecParameters{
@@ -121,27 +150,33 @@ func (c *Client) Connect(ctx context.Context) error {
 	}
 	c.pc = pc
 
-	// Create local audio track for sending audio to the server.
-	localTrack, err := webrtc.NewTrackLocalStaticRTP(
-		webrtc.RTPCodecCapability{
-			MimeType:  webrtc.MimeTypeOpus,
-			ClockRate: 48000,
-			Channels:  1,
-		},
-		"audio",
-		"streamcoreai-client",
-	)
-	if err != nil {
-		c.setStatus(StatusError)
-		pc.Close()
-		return fmt.Errorf("create local track: %w", err)
-	}
-	c.LocalTrack = localTrack
+	// Reuse the outbound track across a redial. It is a public field callers
+	// write RTP to, so replacing it would leave their writer aimed at a track
+	// bound to nothing. TrackLocalStaticRTP supports several bindings, so the
+	// same track simply joins the new PeerConnection.
+	localTrack := c.LocalTrack
+	if localTrack == nil {
+		localTrack, err = webrtc.NewTrackLocalStaticRTP(
+			webrtc.RTPCodecCapability{
+				MimeType:  webrtc.MimeTypeOpus,
+				ClockRate: 48000,
+				Channels:  1,
+			},
+			"audio",
+			"streamcoreai-client",
+		)
+		if err != nil {
+			c.setStatus(StatusError)
+			pc.Close()
+			return fmt.Errorf("create local track: %w", err)
+		}
+		c.LocalTrack = localTrack
 
-	if err := c.initAudioSend(); err != nil {
-		c.setStatus(StatusError)
-		pc.Close()
-		return fmt.Errorf("init audio: %w", err)
+		if err := c.initAudioSend(); err != nil {
+			c.setStatus(StatusError)
+			pc.Close()
+			return fmt.Errorf("init audio: %w", err)
+		}
 	}
 
 	if _, err := pc.AddTrack(localTrack); err != nil {
@@ -179,18 +214,28 @@ func (c *Client) Connect(ctx context.Context) error {
 	})
 
 	pc.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
+		// A PeerConnection this client has already replaced must not report
+		// its own teardown as the client going offline.
+		if c.currentPC() != pc {
+			return
+		}
 		switch state {
 		case webrtc.PeerConnectionStateConnected:
 			c.setStatus(StatusConnected)
-		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
-			c.setStatus(StatusDisconnected)
 		case webrtc.PeerConnectionStateDisconnected:
 			// Transient. ICE often repairs this unaided, so the restart
 			// sequence waits before spending an attempt — but if the local
 			// address changed it never will, and this is the only window in
-			// which a restart can still work: at ~25s the server sees Failed,
-			// closes the peer, and the session becomes unrecoverable.
-			go c.reconnect()
+			// which an ICE restart can work: at ~25s the connection fails and
+			// the server closes its peer.
+			go c.recover()
+		case webrtc.PeerConnectionStateFailed:
+			// Straight to failed, or the restart phase ran out of time. ICE
+			// restart is off the table; only a resume redial can save the
+			// conversation now.
+			go c.recover()
+		case webrtc.PeerConnectionStateClosed:
+			c.setStatus(StatusDisconnected)
 		}
 	})
 
@@ -235,7 +280,7 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.mu.Unlock()
 
 	// WHIP exchange.
-	result, err := whipOffer(c.config.WHIPEndpoint, pc.LocalDescription().SDP, c.config.Metadata, token)
+	result, err := whipOffer(c.config.WHIPEndpoint, pc.LocalDescription().SDP, c.config.Metadata, token, resumeToken)
 	if err != nil {
 		c.setStatus(StatusError)
 		pc.Close()
@@ -244,6 +289,8 @@ func (c *Client) Connect(ctx context.Context) error {
 	c.sessionURL = result.SessionURL
 	c.mu.Lock()
 	c.etag = result.ETag
+	c.resumeToken = result.ResumeToken
+	c.resumeStatus = result.ResumeStatus
 	c.mu.Unlock()
 
 	answer := webrtc.SessionDescription{
@@ -261,6 +308,13 @@ func (c *Client) Connect(ctx context.Context) error {
 
 // Disconnect tears down the WebRTC connection and frees resources.
 func (c *Client) Disconnect() {
+	// Abandons any in-flight recovery: it would otherwise resume a session
+	// this call is about to DELETE.
+	c.mu.Lock()
+	c.generation++
+	c.resumeToken = ""
+	c.resumeStatus = ""
+	c.mu.Unlock()
 	c.cancel()
 
 	// Resolve the token used for the WHIP DELETE. Prefer the cached
@@ -300,88 +354,214 @@ func (c *Client) Disconnect() {
 	c.setStatus(StatusIdle)
 }
 
-// reconnect recovers a dropped transport with an ICE restart, keeping the
-// session — and therefore the conversation — alive on the server.
+// recover recovers a dropped connection, in two phases.
 //
-// Each attempt re-gathers candidates, PATCHes the resulting fragment to the
-// session URL, and folds the server's reply back into the remote description.
-// Between attempts it re-checks the connection state, because plain ICE
-// frequently repairs the drop unaided and a restart would then be wasted work.
-func (c *Client) reconnect() {
-	maxAttempts := c.config.ReconnectAttempts
-	if maxAttempts <= 0 {
-		c.setStatus(StatusDisconnected)
-		return
-	}
-
+// ICE restart first, while the PeerConnection is merely Disconnected. It keeps
+// the transport itself alive — same PeerConnection, same DTLS, same tracks —
+// so nothing above it notices.
+//
+// Resume redial when that is no longer possible: once the connection has
+// Failed the server has closed its peer and there is nothing left to restart.
+// A fresh PeerConnection then POSTs with the session's resume token, and the
+// server reattaches it to the same conversation. The transport is new; the
+// history, the rolling summary and the agent's memory of the call are not.
+//
+// The phases are one sequence rather than two independent ones because they
+// share a deadline: the server holds an abandoned conversation for
+// session_grace_ms (30s by default), and time spent on restarts is time not
+// available for redials.
+func (c *Client) recover() {
 	c.mu.Lock()
-	if c.reconnecting {
+	if c.recovering {
 		c.mu.Unlock()
 		return
 	}
-	c.reconnecting = true
-	pc := c.pc
+	c.recovering = true
+	generation := c.generation
 	sessionURL := c.sessionURL
 	c.mu.Unlock()
 
 	defer func() {
 		c.mu.Lock()
-		c.reconnecting = false
+		c.recovering = false
 		c.mu.Unlock()
 	}()
 
-	if pc == nil || sessionURL == "" {
+	if sessionURL == "" {
 		return
 	}
 
 	c.setStatus(StatusReconnecting)
+	if c.recoverByICERestart(generation, sessionURL) {
+		return
+	}
+	if generation != c.currentGeneration() {
+		return
+	}
+	c.recoverByResume(generation)
+}
+
+// recoverByICERestart is phase one: keep the transport alive with an ICE
+// restart. Returns true when the drop is dealt with — recovered, or abandoned
+// because the client itself went away. False means phase two should take over.
+func (c *Client) recoverByICERestart(generation int, sessionURL string) bool {
+	maxAttempts := c.config.ReconnectAttempts
+	if maxAttempts <= 0 {
+		return false
+	}
 	delay := c.config.ReconnectDelay
 
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		select {
 		case <-time.After(delay):
 		case <-c.ctx.Done():
-			// Disconnect was called; it is about to DELETE this session.
-			return
+			return true // Disconnect was called
 		}
 		delay *= 2
 
+		if generation != c.currentGeneration() {
+			return true
+		}
+		pc := c.currentPC()
+		if pc == nil {
+			return true
+		}
 		switch pc.ConnectionState() {
-		case webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateFailed:
-			return
+		case webrtc.PeerConnectionStateClosed:
+			return true
 		case webrtc.PeerConnectionStateConnected:
 			// Healed on its own while we waited.
 			c.setStatus(StatusConnected)
-			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, ReconnectRecovered, nil})
-			return
+			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, PhaseICERestart, ReconnectRecovered, nil})
+			return true
+		case webrtc.PeerConnectionStateFailed:
+			// The server has already closed its peer; every further restart
+			// would 404.
+			return false
 		}
 
-		c.emitReconnect(ReconnectEvent{attempt, maxAttempts, ReconnectAttempting, nil})
+		c.emitReconnect(ReconnectEvent{attempt, maxAttempts, PhaseICERestart, ReconnectAttempting, nil})
 
 		err := c.restartICE(pc, sessionURL)
 		if err == nil {
 			// The restart is applied; ICE still has to complete its checks, so
 			// the move back to StatusConnected comes from the state handler.
-			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, ReconnectRecovered, nil})
-			return
+			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, PhaseICERestart, ReconnectRecovered, nil})
+			return true
 		}
 
 		var restartErr *WHIPRestartError
-		terminal := errors.As(err, &restartErr) && !restartErr.Retryable()
-		if terminal || attempt == maxAttempts {
-			c.setStatus(StatusDisconnected)
-			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, ReconnectFailed, err})
-			return
-		}
-		// A 412 means another restart landed first; adopt the ETag the server
-		// reported as current and try again against that generation.
-		if restartErr != nil && restartErr.CurrentETag != "" {
-			c.mu.Lock()
-			c.etag = restartErr.CurrentETag
-			c.mu.Unlock()
+		if errors.As(err, &restartErr) {
+			// 404/409/405 mean the session cannot be restarted at all — stop
+			// burning the shared deadline and let the resume phase try.
+			if !restartErr.Retryable() {
+				return false
+			}
+			// A 412 means another restart landed first; adopt the ETag the
+			// server reported as current and try again against that generation.
+			if restartErr.CurrentETag != "" {
+				c.mu.Lock()
+				c.etag = restartErr.CurrentETag
+				c.mu.Unlock()
+			}
 		}
 		log.Printf("[streamcoreai-sdk] ICE restart attempt %d failed: %v", attempt, err)
 	}
+	return false
+}
+
+// recoverByResume is phase two: rebuild the transport and reattach it to the
+// conversation. This is the only recovery available once the connection has
+// failed, and the only one at all for a process that was suspended or offline
+// for longer than ICE tolerates.
+func (c *Client) recoverByResume(generation int) {
+	maxAttempts := c.config.ResumeAttempts
+	c.mu.Lock()
+	token := c.resumeToken
+	c.mu.Unlock()
+
+	if maxAttempts <= 0 || token == "" {
+		c.setStatus(StatusDisconnected)
+		return
+	}
+
+	delay := c.config.ResumeDelay
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		// The dead PeerConnection still holds a binding on the outbound track;
+		// drop it before building its replacement.
+		c.closePeerConnection()
+
+		select {
+		case <-time.After(delay):
+		case <-c.ctx.Done():
+			return
+		}
+		delay *= 2
+
+		if generation != c.currentGeneration() {
+			return
+		}
+
+		c.emitReconnect(ReconnectEvent{attempt, maxAttempts, PhaseResume, ReconnectAttempting, nil})
+
+		if err := c.establish(c.ctx, token); err != nil {
+			if attempt == maxAttempts {
+				c.setStatus(StatusDisconnected)
+				c.emitReconnect(ReconnectEvent{attempt, maxAttempts, PhaseResume, ReconnectFailed, err})
+				return
+			}
+			log.Printf("[streamcoreai-sdk] resume attempt %d failed: %v", attempt, err)
+			continue
+		}
+
+		c.mu.Lock()
+		status := c.resumeStatus
+		c.mu.Unlock()
+
+		if status == "resumed" {
+			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, PhaseResume, ReconnectRecovered, nil})
+		} else {
+			log.Printf("[streamcoreai-sdk] reconnected, but the server could not resume "+
+				"the session (status=%q) — the agent has no memory of the earlier conversation", status)
+			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, PhaseResume, ReconnectRecoveredWithoutHistory, nil})
+		}
+		return
+	}
+}
+
+// closePeerConnection closes the current PeerConnection without touching
+// session state, so a redial can still use the session URL and resume token.
+func (c *Client) closePeerConnection() {
+	c.mu.Lock()
+	pc := c.pc
+	c.pc = nil
+	c.mu.Unlock()
+	if pc == nil {
+		return
+	}
+	// The state handler checks currentPC() and so ignores this teardown.
+	done := make(chan struct{})
+	go func() {
+		pc.Close()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		log.Println("[streamcoreai-sdk] pc.Close() timed out during recovery")
+	}
+}
+
+func (c *Client) currentPC() *webrtc.PeerConnection {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.pc
+}
+
+func (c *Client) currentGeneration() int {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.generation
 }
 
 // restartICE performs one ICE restart round-trip against the existing peer

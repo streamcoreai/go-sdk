@@ -15,6 +15,41 @@ import (
 type WHIPResult struct {
 	AnswerSDP  string
 	SessionURL string
+	// ETag identifies the ICE session (RFC 9725 §4.3.1) and is required to
+	// PATCH it for an ICE restart.
+	ETag string
+}
+
+// WHIPRestartResult holds the server's reply to an ICE restart.
+type WHIPRestartResult struct {
+	// Fragment is the server's sdpfrag, to fold into the stored remote
+	// description.
+	Fragment string
+	// ETag is the rotated tag identifying the new ICE session.
+	ETag string
+}
+
+// WHIPRestartError is returned when a PATCH is rejected. Status lets the
+// caller tell a retryable failure from a terminal one.
+type WHIPRestartError struct {
+	Status int
+	Body   string
+	// CurrentETag is the tag the server reported as current, present on a 412.
+	CurrentETag string
+}
+
+func (e *WHIPRestartError) Error() string {
+	return fmt.Sprintf("whip: ICE restart failed (%d): %s", e.Status, e.Body)
+}
+
+// Retryable reports whether another attempt against the same session could
+// still succeed. A 404 means the session was reaped, 409 that it has no peer
+// to restart, and 405 that the server declines restarts entirely — only a
+// redial recovers from those.
+func (e *WHIPRestartError) Retryable() bool {
+	return e.Status != http.StatusNotFound &&
+		e.Status != http.StatusConflict &&
+		e.Status != http.StatusMethodNotAllowed
 }
 
 // whipOffer performs a WHIP signaling exchange per RFC 9725 §4.2:
@@ -71,7 +106,50 @@ func whipOffer(endpoint, offerSDP string, metadata map[string]string, token stri
 	return &WHIPResult{
 		AnswerSDP:  string(answerBytes),
 		SessionURL: sessionURL,
+		ETag:       resp.Header.Get("ETag"),
 	}, nil
+}
+
+// whipRestartICE sends an ICE restart to the session URL per RFC 9725 §4.4.2.
+//
+// etag is sent as If-Match so a restart racing another one is rejected rather
+// than applied to a generation that no longer exists.
+func whipRestartICE(sessionURL, fragment, etag, token string) (*WHIPRestartResult, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPatch, sessionURL, strings.NewReader(fragment))
+	if err != nil {
+		return nil, fmt.Errorf("whip: create restart request: %w", err)
+	}
+	req.Header.Set("Content-Type", ICEFragmentContentType)
+	if etag != "" {
+		req.Header.Set("If-Match", etag)
+	}
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("whip: PATCH request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		return nil, &WHIPRestartError{
+			Status:      resp.StatusCode,
+			Body:        string(body),
+			CurrentETag: resp.Header.Get("ETag"),
+		}
+	}
+
+	newETag := resp.Header.Get("ETag")
+	if newETag == "" {
+		newETag = etag
+	}
+	return &WHIPRestartResult{Fragment: string(body), ETag: newETag}, nil
 }
 
 // fetchToken POSTs to the given token endpoint and returns the JWT string.

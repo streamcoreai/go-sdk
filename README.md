@@ -1,4 +1,6 @@
-# @streamcoreai/go-sdk
+# github.com/streamcoreai/go-sdk
+
+**English** | [简体中文](./README.zh-CN.md)
 
 Go SDK for connecting to a [StreamCoreAI](https://github.com/streamcoreai/streamcore-server) server via WebRTC + WHIP.
 
@@ -91,14 +93,23 @@ Creates a new client instance.
 | Field          | Type               | Default                              | Description                     |
 | -------------- | ------------------ | ------------------------------------ | ------------------------------- |
 | `WHIPEndpoint` | `string`           | `"http://localhost:8080/whip"`       | WHIP signaling endpoint URL     |
+| `Token`        | `string`           | —                                    | JWT sent as `Authorization: Bearer` on the WHIP request |
+| `TokenURL`     | `string`           | —                                    | Token endpoint; when set, a JWT is fetched before each connection (overrides `Token`) |
+| `APIKey`       | `string`           | —                                    | Sent as `Authorization: Bearer` when fetching from `TokenURL` |
 | `ICEServers`   | `[]webrtc.ICEServer` | Google STUN server                 | ICE server configuration        |
+| `ReconnectAttempts` | `int`         | `3`                                  | ICE restarts to attempt after a drop; negative disables automatic reconnection |
+| `ReconnectDelay` | `time.Duration`  | `2s`                                 | Wait before the first restart attempt, doubling each retry |
 
 #### `EventHandler`
+
+All callbacks are optional; leave unused fields nil.
 
 | Callback               | Signature                                                     | Description                             |
 | ---------------------- | ------------------------------------------------------------- | --------------------------------------- |
 | `OnStatusChange`       | `func(status ConnectionStatus)`                               | Fired when connection status changes    |
 | `OnTranscript`         | `func(entry TranscriptEntry, all []TranscriptEntry)`          | Fired on new or updated transcript      |
+| `OnAgentStateChange`   | `func(state AgentState)`                                      | Fired when the agent starts listening, thinking, or speaking |
+| `OnTiming`             | `func(event TimingEvent)`                                     | Fired with server-side pipeline timing info |
 | `OnError`              | `func(err error)`                                             | Fired on connection or server errors    |
 | `OnDataChannelMessage` | `func(msg DataChannelMessage)`                                | Fired for every raw data channel message |
 
@@ -146,6 +157,45 @@ type DataChannelMessage struct {
     Message string // for error type
 }
 ```
+
+## Reconnection
+
+A network change mid-call — a machine moving networks, a VPN toggle, a NAT
+rebind that does not recover — kills the transport without ending the call. The
+client recovers it with an ICE restart, which keeps the *same* server session:
+the conversation history, the rolling summary, and the agent's state all
+survive, and there is no repeated greeting. This is automatic.
+
+Status goes `StatusConnected` -> `StatusReconnecting` -> `StatusConnected`. Set
+`OnReconnect` for per-attempt detail:
+
+```go
+client := streamcoreai.NewClient(streamcoreai.Config{
+    WHIPEndpoint:      "http://localhost:8080/whip",
+    ReconnectAttempts: 3,
+    ReconnectDelay:    2 * time.Second,
+}, streamcoreai.EventHandler{
+    OnReconnect: func(e streamcoreai.ReconnectEvent) {
+        log.Printf("ICE restart %d/%d: %s", e.Attempt, e.MaxAttempts, e.Outcome)
+    },
+})
+```
+
+Two details worth knowing:
+
+- **The first attempt is deliberately delayed** (`ReconnectDelay`, default 2s).
+  Most drops are brief packet loss that ICE repairs unaided, and patching
+  immediately would spend a restart on a connection that was about to recover
+  by itself.
+- **The whole sequence must finish within ~25 seconds.** That is how long Pion
+  takes to escalate from `Disconnected` to `Failed`, at which point the server
+  closes the peer and the session is gone for good. The defaults (3 attempts at
+  2s, 4s, 8s) fit inside that window — if you raise `ReconnectAttempts`, keep
+  the total under it, or the last attempts are wasted.
+
+If every attempt fails, or the server reports the session is gone (404/409),
+the status becomes `StatusDisconnected`; call `Connect` again for a fresh
+session.
 
 ## Audio I/O
 

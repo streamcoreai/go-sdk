@@ -3,6 +3,7 @@ package streamcoreai
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"sync"
@@ -23,6 +24,10 @@ type Client struct {
 
 	pc         *webrtc.PeerConnection
 	sessionURL string
+	// etag identifies the current ICE session; sent as If-Match on a restart.
+	etag string
+	// reconnecting guards the restart sequence so it is never doubled up.
+	reconnecting bool
 
 	// LocalTrack is the outbound audio track you write RTP packets to.
 	// It is created during Connect() and available afterwards.
@@ -180,7 +185,12 @@ func (c *Client) Connect(ctx context.Context) error {
 		case webrtc.PeerConnectionStateFailed, webrtc.PeerConnectionStateClosed:
 			c.setStatus(StatusDisconnected)
 		case webrtc.PeerConnectionStateDisconnected:
-			c.setStatus(StatusDisconnected)
+			// Transient. ICE often repairs this unaided, so the restart
+			// sequence waits before spending an attempt — but if the local
+			// address changed it never will, and this is the only window in
+			// which a restart can still work: at ~25s the server sees Failed,
+			// closes the peer, and the session becomes unrecoverable.
+			go c.reconnect()
 		}
 	})
 
@@ -232,6 +242,9 @@ func (c *Client) Connect(ctx context.Context) error {
 		return fmt.Errorf("whip offer: %w", err)
 	}
 	c.sessionURL = result.SessionURL
+	c.mu.Lock()
+	c.etag = result.ETag
+	c.mu.Unlock()
 
 	answer := webrtc.SessionDescription{
 		Type: webrtc.SDPTypeAnswer,
@@ -269,6 +282,7 @@ func (c *Client) Disconnect() {
 	c.sessionURL = ""
 	c.mu.Lock()
 	c.lastToken = ""
+	c.etag = ""
 	c.mu.Unlock()
 	if c.pc != nil {
 		done := make(chan struct{})
@@ -284,6 +298,159 @@ func (c *Client) Disconnect() {
 		c.pc = nil
 	}
 	c.setStatus(StatusIdle)
+}
+
+// reconnect recovers a dropped transport with an ICE restart, keeping the
+// session — and therefore the conversation — alive on the server.
+//
+// Each attempt re-gathers candidates, PATCHes the resulting fragment to the
+// session URL, and folds the server's reply back into the remote description.
+// Between attempts it re-checks the connection state, because plain ICE
+// frequently repairs the drop unaided and a restart would then be wasted work.
+func (c *Client) reconnect() {
+	maxAttempts := c.config.ReconnectAttempts
+	if maxAttempts <= 0 {
+		c.setStatus(StatusDisconnected)
+		return
+	}
+
+	c.mu.Lock()
+	if c.reconnecting {
+		c.mu.Unlock()
+		return
+	}
+	c.reconnecting = true
+	pc := c.pc
+	sessionURL := c.sessionURL
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		c.reconnecting = false
+		c.mu.Unlock()
+	}()
+
+	if pc == nil || sessionURL == "" {
+		return
+	}
+
+	c.setStatus(StatusReconnecting)
+	delay := c.config.ReconnectDelay
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		select {
+		case <-time.After(delay):
+		case <-c.ctx.Done():
+			// Disconnect was called; it is about to DELETE this session.
+			return
+		}
+		delay *= 2
+
+		switch pc.ConnectionState() {
+		case webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateFailed:
+			return
+		case webrtc.PeerConnectionStateConnected:
+			// Healed on its own while we waited.
+			c.setStatus(StatusConnected)
+			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, ReconnectRecovered, nil})
+			return
+		}
+
+		c.emitReconnect(ReconnectEvent{attempt, maxAttempts, ReconnectAttempting, nil})
+
+		err := c.restartICE(pc, sessionURL)
+		if err == nil {
+			// The restart is applied; ICE still has to complete its checks, so
+			// the move back to StatusConnected comes from the state handler.
+			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, ReconnectRecovered, nil})
+			return
+		}
+
+		var restartErr *WHIPRestartError
+		terminal := errors.As(err, &restartErr) && !restartErr.Retryable()
+		if terminal || attempt == maxAttempts {
+			c.setStatus(StatusDisconnected)
+			c.emitReconnect(ReconnectEvent{attempt, maxAttempts, ReconnectFailed, err})
+			return
+		}
+		// A 412 means another restart landed first; adopt the ETag the server
+		// reported as current and try again against that generation.
+		if restartErr != nil && restartErr.CurrentETag != "" {
+			c.mu.Lock()
+			c.etag = restartErr.CurrentETag
+			c.mu.Unlock()
+		}
+		log.Printf("[streamcoreai-sdk] ICE restart attempt %d failed: %v", attempt, err)
+	}
+}
+
+// restartICE performs one ICE restart round-trip against the existing peer
+// connection.
+func (c *Client) restartICE(pc *webrtc.PeerConnection, sessionURL string) error {
+	remote := pc.RemoteDescription()
+	if remote == nil {
+		return fmt.Errorf("no remote description to restart against")
+	}
+
+	offer, err := pc.CreateOffer(&webrtc.OfferOptions{ICERestart: true})
+	if err != nil {
+		return fmt.Errorf("create restart offer: %w", err)
+	}
+	// The promise must be created after CreateOffer, which is what reopens
+	// gathering — one made earlier would resolve against the old generation.
+	gatherDone := webrtc.GatheringCompletePromise(pc)
+	if err := pc.SetLocalDescription(offer); err != nil {
+		return fmt.Errorf("set restart offer: %w", err)
+	}
+	select {
+	case <-gatherDone:
+	case <-time.After(5 * time.Second):
+		log.Println("[streamcoreai-sdk] ICE re-gathering timed out, patching partial candidates")
+	case <-c.ctx.Done():
+		return c.ctx.Err()
+	}
+
+	c.mu.Lock()
+	etag, token := c.etag, c.lastToken
+	c.mu.Unlock()
+	if token == "" {
+		token = c.config.Token
+	}
+
+	result, err := whipRestartICE(
+		sessionURL,
+		iceFragmentFromSDP(pc.LocalDescription().SDP),
+		etag,
+		token,
+	)
+	if err != nil {
+		return err
+	}
+
+	answerSDP, ok := applyICEFragment(remote.SDP, result.Fragment)
+	if !ok {
+		return fmt.Errorf("ICE restart reply has no ICE credentials")
+	}
+
+	// The offer left us in have-local-offer; the connection only returns to
+	// stable once this answer is applied.
+	if err := pc.SetRemoteDescription(webrtc.SessionDescription{
+		Type: webrtc.SDPTypeAnswer,
+		SDP:  answerSDP,
+	}); err != nil {
+		return fmt.Errorf("set restart answer: %w", err)
+	}
+
+	c.mu.Lock()
+	c.etag = result.ETag
+	c.mu.Unlock()
+	return nil
+}
+
+func (c *Client) emitReconnect(event ReconnectEvent) {
+	if c.events.OnReconnect != nil {
+		c.events.OnReconnect(event)
+	}
 }
 
 func (c *Client) setStatus(s ConnectionStatus) {

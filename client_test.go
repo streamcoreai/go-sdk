@@ -145,7 +145,7 @@ func TestFetchToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	tok, err := fetchToken(srv.URL, "key-123")
+	tok, err := fetchToken(srv.URL, "key-123", "")
 	if err != nil {
 		t.Fatalf("fetchToken: %v", err)
 	}

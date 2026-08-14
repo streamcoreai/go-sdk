@@ -106,6 +106,15 @@ type Config struct {
 	// APIKey is sent as a Bearer header when fetching a token from TokenURL.
 	APIKey string
 
+	// ResourceID is who is on the call: an app user ID, or the number a phone
+	// call came from. The server passes it to an external agent, which can then
+	// remember a caller across separate calls.
+	//
+	// With TokenURL set it goes in the token request body and the server signs
+	// it into the token. Otherwise it goes as a header, which the server only
+	// trusts when there is no signed claim.
+	ResourceID string
+
 	// ICEServers configures the ICE servers for the WebRTC connection.
 	// Defaults to Google's public STUN server.
 	ICEServers []webrtc.ICEServer

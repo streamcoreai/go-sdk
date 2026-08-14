@@ -265,7 +265,7 @@ func (c *Client) establish(ctx context.Context, resumeToken string) error {
 	// Fetch a fresh token from the token endpoint if configured.
 	token := c.config.Token
 	if c.config.TokenURL != "" {
-		t, err := fetchToken(c.config.TokenURL, c.config.APIKey)
+		t, err := fetchToken(c.config.TokenURL, c.config.APIKey, c.config.ResourceID)
 		if err != nil {
 			c.setStatus(StatusError)
 			pc.Close()
@@ -280,7 +280,7 @@ func (c *Client) establish(ctx context.Context, resumeToken string) error {
 	c.mu.Unlock()
 
 	// WHIP exchange.
-	result, err := whipOffer(c.config.WHIPEndpoint, pc.LocalDescription().SDP, c.config.Metadata, token, resumeToken)
+	result, err := whipOffer(c.config.WHIPEndpoint, pc.LocalDescription().SDP, c.config.Metadata, token, resumeToken, c.config.ResourceID)
 	if err != nil {
 		c.setStatus(StatusError)
 		pc.Close()
@@ -328,7 +328,7 @@ func (c *Client) Disconnect() {
 		token = c.config.Token
 	}
 	if token == "" && c.config.TokenURL != "" {
-		if t, err := fetchToken(c.config.TokenURL, c.config.APIKey); err == nil {
+		if t, err := fetchToken(c.config.TokenURL, c.config.APIKey, c.config.ResourceID); err == nil {
 			token = t
 		}
 	}

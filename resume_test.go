@@ -27,7 +27,7 @@ func TestWhipOfferCarriesResumeToken(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	first, err := whipOffer(srv.URL, "v=0\r\n", nil, "", "")
+	first, err := whipOffer(srv.URL, "v=0\r\n", nil, "", "", "")
 	if err != nil {
 		t.Fatalf("whipOffer: %v", err)
 	}
@@ -38,7 +38,7 @@ func TestWhipOfferCarriesResumeToken(t *testing.T) {
 		t.Fatalf("first: status=%q token=%q", first.ResumeStatus, first.ResumeToken)
 	}
 
-	second, err := whipOffer(srv.URL, "v=0\r\n", map[string]string{"direction": "inbound"}, "", first.ResumeToken)
+	second, err := whipOffer(srv.URL, "v=0\r\n", map[string]string{"direction": "inbound"}, "", first.ResumeToken, "")
 	if err != nil {
 		t.Fatalf("whipOffer resume: %v", err)
 	}

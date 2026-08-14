@@ -1,6 +1,7 @@
 package streamcoreai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,10 @@ import (
 	"strings"
 	"time"
 )
+
+// ResourceIDHeader carries the caller identity when there is no token endpoint
+// to sign one into a claim. For server-side clients, not browsers.
+const ResourceIDHeader = "X-StreamCore-Resource-Id"
 
 // WHIPResult holds the response from a WHIP signaling exchange.
 type WHIPResult struct {
@@ -67,7 +72,10 @@ func (e *WHIPRestartError) Retryable() bool {
 // than starting a fresh one. Check ResumeStatus on the result — a token the
 // server no longer recognises still yields a working call, but one whose agent
 // remembers nothing.
-func whipOffer(endpoint, offerSDP string, metadata map[string]string, token, resumeToken string) (*WHIPResult, error) {
+//
+// resourceID goes in a header, not a query parameter, and the server ignores it
+// whenever the token already carries a claim.
+func whipOffer(endpoint, offerSDP string, metadata map[string]string, token, resumeToken, resourceID string) (*WHIPResult, error) {
 	// Append metadata and the resume token as query parameters.
 	if len(metadata) > 0 || resumeToken != "" {
 		parsed, err := url.Parse(endpoint)
@@ -91,6 +99,9 @@ func whipOffer(endpoint, offerSDP string, metadata map[string]string, token, res
 	req.Header.Set("Content-Type", "application/sdp")
 	if token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	if resourceID != "" {
+		req.Header.Set(ResourceIDHeader, resourceID)
 	}
 
 	resp, err := http.DefaultClient.Do(req)
@@ -172,10 +183,25 @@ func whipRestartICE(sessionURL, fragment, etag, token string) (*WHIPRestartResul
 
 // fetchToken POSTs to the given token endpoint and returns the JWT string.
 // If apiKey is non-empty it is sent as a Bearer Authorization header.
-func fetchToken(tokenURL, apiKey string) (string, error) {
-	req, err := http.NewRequest(http.MethodPost, tokenURL, nil)
+//
+// A non-empty resourceID goes in the body for the server to sign into the
+// token. This call carries the API key, which is why it is trusted to say so.
+func fetchToken(tokenURL, apiKey, resourceID string) (string, error) {
+	var body io.Reader
+	if resourceID != "" {
+		payload, err := json.Marshal(map[string]string{"resource_id": resourceID})
+		if err != nil {
+			return "", fmt.Errorf("token request: %w", err)
+		}
+		body = bytes.NewReader(payload)
+	}
+
+	req, err := http.NewRequest(http.MethodPost, tokenURL, body)
 	if err != nil {
 		return "", fmt.Errorf("token request: %w", err)
+	}
+	if body != nil {
+		req.Header.Set("Content-Type", "application/json")
 	}
 	if apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+apiKey)

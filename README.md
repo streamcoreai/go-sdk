@@ -96,6 +96,7 @@ Creates a new client instance.
 | `Token`        | `string`           | —                                    | JWT sent as `Authorization: Bearer` on the WHIP request |
 | `TokenURL`     | `string`           | —                                    | Token endpoint; when set, a JWT is fetched before each connection (overrides `Token`) |
 | `APIKey`       | `string`           | —                                    | Sent as `Authorization: Bearer` when fetching from `TokenURL` |
+| `ResourceID`   | `string`           | —                                    | Who is on the call, forwarded to an external agent so it can scope memory to the person rather than the call. Sent in the token request body when `TokenURL` is set (the server signs it into the token), otherwise as an `X-StreamCore-Resource-Id` header |
 | `ICEServers`   | `[]webrtc.ICEServer` | Google STUN server                 | ICE server configuration        |
 | `ReconnectAttempts` | `int`         | `3`                                  | ICE restarts while `Disconnected`; negative disables the phase |
 | `ReconnectDelay` | `time.Duration`  | `2s`                                 | Wait before the first ICE restart, doubling each retry |

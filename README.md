@@ -115,6 +115,7 @@ All callbacks are optional; leave unused fields nil.
 | `OnTiming`             | `func(event TimingEvent)`                                     | Fired with server-side pipeline timing info |
 | `OnError`              | `func(err error)`                                             | Fired on connection or server errors    |
 | `OnDataChannelMessage` | `func(msg DataChannelMessage)`                                | Fired for every raw data channel message |
+| `OnData`               | `func(topic string, payload []byte)`                          | Fire-and-forget server data packet, payload already base64-decoded (`movement.command` carries locomotion commands) |
 
 ### Client Methods
 

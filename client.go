@@ -2,6 +2,7 @@ package streamcoreai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -720,5 +721,16 @@ func (c *Client) handleDataChannelMessage(msg DataChannelMessage) {
 		if c.events.OnAgentStateChange != nil && msg.State != "" {
 			c.events.OnAgentStateChange(AgentState(msg.State))
 		}
+
+	case "data":
+		if c.events.OnData == nil {
+			return
+		}
+		payload, err := base64.StdEncoding.DecodeString(msg.Payload)
+		if err != nil {
+			log.Printf("[streamcoreai-sdk] bad base64 on topic %s: %v", msg.Topic, err)
+			return
+		}
+		c.events.OnData(msg.Topic, payload)
 	}
 }

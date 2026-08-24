@@ -81,13 +81,15 @@ type TimingEvent struct {
 
 // DataChannelMessage represents a message received on the data channel.
 type DataChannelMessage struct {
-	Type    string `json:"type"` // "transcript", "response", "error", "timing", or "state"
+	Type    string `json:"type"` // "transcript", "response", "error", "timing", "state", or "data"
 	Text    string `json:"text,omitempty"`
 	Final   bool   `json:"final,omitempty"`
 	Message string `json:"message,omitempty"` // for error type
 	Stage   string `json:"stage,omitempty"`   // for timing type
 	Ms      int    `json:"ms,omitempty"`      // for timing type
 	State   string `json:"state,omitempty"`   // for state type
+	Topic   string `json:"topic,omitempty"`   // for data type
+	Payload string `json:"payload,omitempty"` // for data type; base64-encoded JSON
 }
 
 // Config holds the configuration for a StreamCoreAIClient.
@@ -177,6 +179,13 @@ type EventHandler struct {
 	// OnDataChannelMessage is called for every raw data channel message.
 	// This is optional and useful for custom message handling.
 	OnDataChannelMessage func(msg DataChannelMessage)
+
+	// OnData is called for a topic-addressed packet from a device-side tool,
+	// with the payload already base64-decoded. The server sends these
+	// fire-and-forget — it has already told the model the action succeeded —
+	// so there is nothing to reply to. Locomotion commands from the movement.*
+	// tools arrive on the "movement.command" topic.
+	OnData func(topic string, payload []byte)
 
 	// OnReconnect is called for each recovery attempt and once when the
 	// outcome is known, so a UI can distinguish a recoverable drop from a

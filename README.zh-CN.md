@@ -111,6 +111,7 @@ func main() {
 | `OnTiming`             | `func(event TimingEvent)`                                     | 携带服务端流水线耗时信息 |
 | `OnError`              | `func(err error)`                                             | 连接或服务端错误时触发    |
 | `OnDataChannelMessage` | `func(msg DataChannelMessage)`                                | 每条原始 DataChannel 消息都会触发 |
+| `OnData`               | `func(topic string, payload []byte)`                          | 服务端下发的单向数据包，payload 已完成 base64 解码（`movement.command` 承载移动指令） |
 
 ### 客户端方法
 
